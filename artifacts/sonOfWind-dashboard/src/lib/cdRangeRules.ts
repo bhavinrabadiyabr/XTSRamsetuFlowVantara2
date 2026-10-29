@@ -463,3 +463,24 @@ export function decideExit(opts: {
   if (ltp <= trailArmPx(sold, trailArmPct) + 1e-9) return { kind: "NONE", armTrail: true };
   return { kind: "NONE", armTrail: opts.trailArmed };
 }
+
+export type LogKind = "info" | "entry" | "exit" | "error";
+
+function round2(value: number): number {
+  return Math.round((value + 1e-9) * 100) / 100;
+}
+
+export function badPremiumTick(fill: number, premium: number): boolean {
+  return fill >= 5 && premium < 0.5;
+}
+
+export function shortMtm(fill: number, premium: number, qty: number): number {
+  return round2((fill - premium) * qty);
+}
+
+export function signedPts(points: number): string {
+  const body = Math.abs(points).toFixed(2);
+  if (points > 0) return `+${body}`;
+  if (points < 0) return `-${body}`;
+  return body;
+}

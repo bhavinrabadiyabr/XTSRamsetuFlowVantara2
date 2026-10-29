@@ -11,7 +11,7 @@ import re
 import threading
 import time
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from market.dada_range import (
     IST,
@@ -31,6 +31,22 @@ CACHE_SECONDS = 2.0
 
 _LOCK = threading.Lock()
 _CACHE: dict[str, Any] = {"at": 0.0, "day": "", "payload": None}
+_MD_CLIENT: Callable[[], Any] | None = None
+
+
+def set_cd_md_client(getter: Callable[[], Any] | None) -> None:
+    """XTS market-data client used to fetch Sensex minute bars. Set from the API route."""
+    global _MD_CLIENT
+    _MD_CLIENT = getter
+
+
+def _xts_client() -> Any:
+    if _MD_CLIENT is None:
+        raise RuntimeError("XTS history is not configured")
+    client = _MD_CLIENT()
+    if client is None:
+        raise RuntimeError("XTS history is not configured")
+    return client
 
 
 def parse_range_params(tf: str, candles: str, min_gap: str) -> dict[str, Any] | None:
@@ -116,8 +132,6 @@ def build_cd_range(
 
 
 def _fetch_default() -> list[OhlcBar]:
-    from market.nifty_vwap import _xts_client
-
     return fetch_session_1m_bars(
         _xts_client(),
         exchange_segment=SENSEX_SEGMENT,

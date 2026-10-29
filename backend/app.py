@@ -2169,85 +2169,6 @@ def md_focus():
     return jsonify({"ok": True, "channel": channel, "count": len(instruments)})
 
 
-@app.get("/api/vwap/data")
-def api_vwap_data():
-    """Session ohlc4 VWAP from XTS 1-minute Nifty candles. The last price is not the line."""
-    username = (_current_user() or "").strip().upper()
-    if not username:
-        return jsonify({"ok": False, "error": "Unauthorized", "signal": "NONE", "signalLabel": "No trade"}), 401
-    try:
-        _ensure_market_streamer(username)
-        from market.dashboard_connector import wire_market_streamer
-        from market.nifty_vwap import get_vwap_payload, set_vwap_md_client
-
-        wire_market_streamer(_MD_STREAMER)
-        set_vwap_md_client(lambda: _MD_STREAMER.rest_client())
-        return jsonify(get_vwap_payload())
-    except Exception as exc:
-        app.logger.exception("api_vwap_data failed")
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-                "stale": False,
-                "vwap": 0,
-                "liveVwap": 0,
-                "signal": "NONE",
-                "signalLabel": "No trade",
-            }
-        )
-
-
-@app.get("/api/vwap/sensex")
-def api_sensex_vwap_data():
-    """Session ohlc4 VWAP from XTS 1-minute Sensex candles. The last price is not the line."""
-    username = (_current_user() or "").strip().upper()
-    if not username:
-        return jsonify({"ok": False, "error": "Unauthorized", "signal": "NONE", "signalLabel": "No trade"}), 401
-    try:
-        _ensure_market_streamer(username)
-        from market.dashboard_connector import wire_market_streamer
-        from market.sensex_vwap import get_vwap_payload, set_vwap_md_client
-
-        wire_market_streamer(_MD_STREAMER)
-        set_vwap_md_client(lambda: _MD_STREAMER.rest_client())
-        return jsonify(get_vwap_payload())
-    except Exception as exc:
-        app.logger.exception("api_sensex_vwap_data failed")
-        return jsonify(
-            {
-                "ok": False,
-                "error": str(exc),
-                "stale": False,
-                "vwap": 0,
-                "liveVwap": 0,
-                "signal": "NONE",
-                "signalLabel": "No trade",
-            }
-        )
-
-
-@app.get("/api/fast1/open")
-def api_fast1_open():
-    """Locked 09:20 one-minute spot open. Nifty or Sensex follows the query."""
-    username = (_current_user() or "").strip().upper()
-    if not username:
-        return jsonify({"ok": False, "error": "Unauthorized", "spot": None, "pending": False}), 401
-    underlying = str(request.args.get("underlying") or "NIFTY")
-    try:
-        _ensure_market_streamer(username)
-        from market.dashboard_connector import wire_market_streamer
-        from market.fast1_open import get_open
-        from market.nifty_vwap import set_vwap_md_client
-
-        wire_market_streamer(_MD_STREAMER)
-        set_vwap_md_client(lambda: _MD_STREAMER.rest_client())
-        return jsonify(get_open(underlying))
-    except Exception as exc:
-        app.logger.exception("api_fast1_open failed")
-        return jsonify({"ok": False, "pending": True, "error": str(exc), "spot": None, "source": None})
-
-
 @app.get("/api/cd/range")
 def api_cd_range():
     """Rolling HIGH/LOW of the last N closed TF-minute Sensex bars. The live bar is excluded."""
@@ -2256,12 +2177,11 @@ def api_cd_range():
         return jsonify({"ok": False, "error": "Unauthorized", "ready": False, "tradable": False}), 401
     try:
         _ensure_market_streamer(username)
-        from market.cd_range import get_range, parse_range_params
+        from market.cd_range import get_range, parse_range_params, set_cd_md_client
         from market.dashboard_connector import wire_market_streamer
-        from market.nifty_vwap import set_vwap_md_client
 
         wire_market_streamer(_MD_STREAMER)
-        set_vwap_md_client(lambda: _MD_STREAMER.rest_client())
+        set_cd_md_client(lambda: _MD_STREAMER.rest_client())
         params = parse_range_params(
             str(request.args.get("tf", "15")),
             str(request.args.get("candles", "4")),
@@ -4196,7 +4116,7 @@ def api_ix_place_order():
         unfilled_ioc = bool(reject) and (
             "16388" in reject or "cancelled by system" in reject.lower() or "canceled by system" in reject.lower()
         )
-        # Wish handles 16388 itself: a cancel that already traded is a fill, not a reject.
+        # CD books only a fill: a cancel that already traded is a fill, not a reject.
         if reject and not book_only and not (execute_pending and unfilled_ioc):
             return _json_no_store(
                 {"ok": False, "error": reject, "request": payload, "raw": res, "fillHint": fill_hint},
