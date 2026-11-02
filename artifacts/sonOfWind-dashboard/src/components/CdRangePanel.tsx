@@ -25,9 +25,12 @@ import {
   pastCutoff,
   roundScore,
   squareTime,
+  ctcLockPct,
+  ctcStopPx,
   stopPx,
   targetPx,
   trailArmPx,
+  trailCtcPx,
   trailStopPx,
   signedPts,
   shortMtm,
@@ -55,6 +58,7 @@ type CdPosition = {
   fillPx: number;
   segment: number;
   trailArmed: boolean;
+  ctcLocked: boolean;
 };
 
 type CdLog = { id: number; text: string; kind: LogKind };
@@ -116,9 +120,11 @@ function loadSession(): CdSession | null {
       v: 2,
       sessionDate: today,
       settings,
-      draft: current.draft,
+      draft: { ...draftFromSettings(settings), ...current.draft },
       running: current.running === true,
-      position: current.position ?? null,
+      position: current.position
+        ? { ...current.position, trailArmed: current.position.trailArmed === true, ctcLocked: current.position.ctcLocked === true }
+        : null,
       logs: Array.isArray(current.logs) ? current.logs : [],
       nextLogId: current.nextLogId || 1,
       score: typeof current.score === "number" ? current.score : 0,
@@ -137,7 +143,9 @@ function loadSession(): CdSession | null {
     settings,
     draft: draftFromSettings(settings),
     running: old.running === true,
-    position: old.position ?? null,
+    position: old.position
+      ? { ...old.position, trailArmed: old.position.trailArmed === true, ctcLocked: old.position.ctcLocked === true }
+      : null,
     logs: Array.isArray(old.logs) ? old.logs : [],
     nextLogId: old.nextLogId || 1,
     score: typeof old.score === "number" ? old.score : 0,
@@ -216,19 +224,22 @@ export default function CdRangePanel({
   seenInsideRef.current = seenInside;
   rangeRef.current = range;
 
-  const liveSpot =
+  const futSeg = typeof range?.exchangeSegment === "number" ? range.exchangeSegment : 0;
+  const futId = typeof range?.exchangeInstrumentID === "number" ? range.exchangeInstrumentID : 0;
+  const indexSpot =
     typeof ltps[chain.spotToken] === "number" && ltps[chain.spotToken]! > 0 ? ltps[chain.spotToken]! : null;
-  liveSpotRef.current = liveSpot;
+  const chartPx = premiumOf(futId > 0 ? futId : null, ltps);
+  liveSpotRef.current = chartPx;
 
   const step = CD.strikeStep;
   const bookMap = book?.instrumentMap;
-  const atm = atmStrike(liveSpot && liveSpot > 0 ? liveSpot : chain.spotLtp || chain.atmStrike, step);
+  const atm = atmStrike(indexSpot && indexSpot > 0 ? indexSpot : chain.spotLtp || chain.atmStrike, step);
   const ceIid = bookMap?.[String(atm)]?.ce ?? null;
   const peIid = bookMap?.[String(atm)]?.pe ?? null;
   const cePx = premiumOf(typeof ceIid === "number" ? ceIid : null, ltps);
   const pePx = premiumOf(typeof peIid === "number" ? peIid : null, ltps);
   const qty = orderQty(live.lots);
-  const signal = breakout(liveSpot, range?.high, range?.low, live.extra);
+  const signal = breakout(chartPx, range?.high, range?.low, live.extra);
   const unsaved = isUnsaved(draft, live);
   const firstEntry = firstEntryLabel(live.candles, live.tfMin);
 
@@ -242,8 +253,10 @@ export default function CdRangePanel({
     return Array.from(new Set(ids));
   }, [active, ceIid, peIid, position?.instrumentId, running]);
 
+  const futIds = useMemo(() => (futId > 0 ? [futId] : []), [futId]);
   useSubscribeTouchline(book?.optionSegment || chain.optionSegment, watchIds);
   useSubscribeTouchline(chain.spotSegment, chain.spotToken > 0 ? [chain.spotToken] : []);
+  useSubscribeTouchline(futSeg, futIds);
 
   const pushLog = useCallback((text: string, kind: LogKind) => {
     const id = logIdRef.current++;
@@ -325,7 +338,7 @@ export default function CdRangePanel({
             ok: false,
             ready: false,
             tradable: false,
-            error: err instanceof Error ? err.message : "Sensex range fetch failed",
+            error: err instanceof Error ? err.message : "SENSEX futures range fetch failed",
           });
         }
       }
@@ -431,6 +444,7 @@ export default function CdRangePanel({
     if (!onIndex) return;
     const instruments = [
       ...(chain.spotToken > 0 ? [{ exchangeSegment: chain.spotSegment, exchangeInstrumentID: chain.spotToken }] : []),
+      ...(futId > 0 ? [{ exchangeSegment: futSeg, exchangeInstrumentID: futId }] : []),
       ...watchIds.map((id) => ({
         exchangeSegment: book?.optionSegment || chain.optionSegment,
         exchangeInstrumentID: id,
@@ -440,7 +454,7 @@ export default function CdRangePanel({
       method: "POST",
       body: JSON.stringify({ channel: CD.focusChannel, instruments }),
     }).catch(() => {});
-  }, [book?.optionSegment, chain.optionSegment, chain.spotSegment, chain.spotToken, onIndex, watchIds]);
+  }, [book?.optionSegment, chain.optionSegment, chain.spotSegment, chain.spotToken, futId, futSeg, onIndex, watchIds]);
 
   const sendOrder = useCallback(async (sideOrder: "BUY" | "SELL", instrumentId: number, orderQuantity: number): Promise<OrderResult> => {
     const tick = peekLiveTick(instrumentId);
@@ -526,11 +540,11 @@ export default function CdRangePanel({
       const picked = pickSide(optionType);
       if (!picked || !(spot && spot > 0) || order == null || box?.high == null || box.low == null) {
         sellRetryRef.current = Date.now() + CD.sellRetryMs;
-        pushLog("Sell not sent. Spot, the Thursday expiry, the range, and lots 1–50 are required. Retry in 60s.", "error");
+        pushLog("Sell not sent. The future, the Thursday expiry, the range, and lots 1–50 are required. Retry in 60s.", "error");
         return false;
       }
       if (breakout(spot, box.high, box.low, saved.extra) !== optionType) {
-        pushLog("Sell skipped. Spot is no longer through the range.", "info");
+        pushLog("Sell skipped. The future is no longer through the range.", "info");
         return false;
       }
       const sold = await sendOrder("SELL", picked.instrumentId, order);
@@ -550,9 +564,10 @@ export default function CdRangePanel({
         fillPx: sold.fill,
         segment: picked.segment,
         trailArmed: false,
+        ctcLocked: false,
       });
       pushLog(
-        `spot ${spot.toFixed(2)} ${word} ${level.toFixed(2)}: SELL ATM ${optionType} ${picked.strike.toLocaleString("en-IN")} × ${fmtQty(sold.filledQty)} @ ${sold.fill.toFixed(2)}${reason === "FLIP" ? " · flip" : ""}`,
+        `${box.contract || "Future"} ${spot.toFixed(2)} ${word} ${level.toFixed(2)}: SELL ATM ${optionType} ${picked.strike.toLocaleString("en-IN")} × ${fmtQty(sold.filledQty)} @ ${sold.fill.toFixed(2)}${reason === "FLIP" ? " · flip" : ""}`,
         "entry",
       );
       return true;
@@ -682,22 +697,34 @@ export default function CdRangePanel({
         sold: pos.fillPx,
         ltp,
         trailArmed: pos.trailArmed,
+        ctcLocked: pos.ctcLocked === true,
         canFlip: hunting && bookRef.current != null,
         midOn: liveRef.current.midStop,
         extra: liveRef.current.extra,
         slPct: liveRef.current.slPct,
         trailArmPct: liveRef.current.trailArmPct,
         trailLockPct: liveRef.current.trailLockPct,
+        trailCtcPct: liveRef.current.trailCtcPct,
         targetPct: liveRef.current.targetPct,
       });
       if (exit.kind === "NONE") {
+        let next = pos;
         if (exit.armTrail && !pos.trailArmed) {
-          remember({ ...pos, trailArmed: true });
+          next = { ...next, trailArmed: true };
           pushLog(
             `Trail armed at ${trailArmPx(pos.fillPx, liveRef.current.trailArmPct).toFixed(2)}. Cover if LTP comes back to ${trailStopPx(pos.fillPx, liveRef.current.trailLockPct).toFixed(2)}.`,
             "info",
           );
         }
+        if (exit.armCtc && !pos.ctcLocked) {
+          const lock = ctcLockPct(liveRef.current.trailCtcPct, liveRef.current.trailArmPct);
+          next = { ...next, ctcLocked: true };
+          pushLog(
+            `TRAIL CTC ${liveRef.current.trailCtcPct}%. SL moved to ${ctcStopPx(pos.fillPx, liveRef.current.trailCtcPct, liveRef.current.trailArmPct).toFixed(2)} to lock ${lock}% profit.`,
+            "info",
+          );
+        }
+        if (next !== pos) remember(next);
         if (squareTime(today.hh, today.mm)) {
           squaredRef.current = true;
           setSquared(true);
@@ -741,7 +768,7 @@ export default function CdRangePanel({
     const extra = liveRef.current.extra;
     const pad = extra > 0 ? ` + ${extra}` : "";
     const cut = extra > 0 ? ` − ${extra}` : "";
-    pushLog(`Hunting. Spot above HIGH${pad} sells the ATM PE. Spot below LOW${cut} sells the ATM CE.`, "info");
+    pushLog(`Hunting. Future above HIGH${pad} sells the ATM PE. Future below LOW${cut} sells the ATM CE.`, "info");
   };
 
   const save = () => {
@@ -812,26 +839,39 @@ export default function CdRangePanel({
   });
   const above = live.extra > 0 ? `above HIGH + ${live.extra}` : "above HIGH";
   const below = live.extra > 0 ? `below LOW − ${live.extra}` : "below LOW";
+  const ctcDiff = ctcLockPct(live.trailCtcPct, live.trailArmPct);
   const trailText =
     live.trailLockPct === 0
       ? `trail arm ${live.trailArmPct}% then cover at the sell fill`
       : `trail arm ${live.trailArmPct}% then cover ${live.trailLockPct}% under the sell`;
-  const idleRule = `${live.candles} × ${live.tfMin}m · gap ${live.minGap} · extra ${live.extra} · Target ${live.targetPct}% · ${trailText} · SL ${live.slPct}% · MID ${live.midStop ? "on" : "off"} · no entry after 14:30 · square 15:14`;
+  const ctcText = `TRAIL CTC ${live.trailCtcPct} locks ${ctcDiff}%`;
+  const idleRule = `${live.candles} × ${live.tfMin}m · gap ${live.minGap} · extra ${live.extra} · Target ${live.targetPct}% · ${trailText} · ${ctcText} · SL ${live.slPct}% · MID ${live.midStop ? "on" : "off"} · futures high/low · no entry after 14:30 · square 15:14`;
+  const openSl = position?.ctcLocked
+    ? `SL ≥ ${ctcStopPx(position.fillPx, live.trailCtcPct, live.trailArmPct).toFixed(2)} locks ${ctcDiff}%`
+    : `SL ≥ ${stopPx(position?.fillPx ?? 0, live.slPct).toFixed(2)} · TRAIL CTC ≤ ${trailCtcPx(position?.fillPx ?? 0, live.trailCtcPct).toFixed(2)} moves SL to ${ctcStopPx(position?.fillPx ?? 0, live.trailCtcPct, live.trailArmPct).toFixed(2)}`;
   const openRule = position
-    ? `Target ≤ ${targetPx(position.fillPx, live.targetPct).toFixed(2)} · trail arms ≤ ${trailArmPx(position.fillPx, live.trailArmPct).toFixed(2)} then covers ≥ ${trailStopPx(position.fillPx, live.trailLockPct).toFixed(2)} · SL ≥ ${stopPx(position.fillPx, live.slPct).toFixed(2)}`
+    ? `Target ≤ ${targetPx(position.fillPx, live.targetPct).toFixed(2)} · trail arms ≤ ${trailArmPx(position.fillPx, live.trailArmPct).toFixed(2)} then covers ≥ ${trailStopPx(position.fillPx, live.trailLockPct).toFixed(2)} · ${openSl}`
     : idleRule;
 
   return (
     <div className="nw-desk flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="nw-stats shrink-0">
-        <Stat tone="vwap" label="HIGH" value={high != null ? fmtPrice(high) : "—"} sub={windowLabel} />
-        <Stat tone="vwap" label="LOW" value={low != null ? fmtPrice(low) : "—"} sub={gap != null ? `gap ${fmtPrice(gap)}` : "—"} />
+        <Stat tone="vwap" label="HIGH" value={high != null ? fmtPrice(high) : "—"} sub={range?.contract ? `${range.contract} · ${windowLabel}` : windowLabel} />
+        <Stat tone="vwap" label="LOW" value={low != null ? fmtPrice(low) : "—"} sub={gap != null ? `gap ${fmtPrice(gap)}` : range?.contractExpiry || "—"} />
         <Stat tone="spot" label="MID" value={mid != null ? fmtPrice(mid) : "—"} sub={live.midStop ? "stop on" : "stop off"} />
         <Stat
           tone={signal === "PE" ? "up" : signal === "CE" ? "down" : "spot"}
-          label="Sensex"
-          value={liveSpot != null ? fmtPrice(liveSpot) : "—"}
-          sub={signal === "PE" ? above : signal === "CE" ? below : "inside / flat"}
+          label="Futures"
+          value={chartPx != null ? fmtPrice(chartPx) : "—"}
+          sub={
+            range?.contract
+              ? `${range.contract} · ${signal === "PE" ? above : signal === "CE" ? below : "inside / flat"}`
+              : signal === "PE"
+                ? above
+                : signal === "CE"
+                  ? below
+                  : "inside / flat"
+          }
         />
         <Stat
           tone={signal === "CE" ? "ce" : signal === "PE" ? "pe" : "flat"}
@@ -854,7 +894,21 @@ export default function CdRangePanel({
           <DraftField label="Candles" value={draft.candles} onChange={(value) => setDraft((prev) => ({ ...prev, candles: value }))} />
           <DraftField label="Min gap" value={draft.minGap} onChange={(value) => setDraft((prev) => ({ ...prev, minGap: value }))} />
           <DraftField label="SL %" value={draft.slPct} onChange={(value) => setDraft((prev) => ({ ...prev, slPct: value }))} />
-          <DraftField label="Trail arm %" value={draft.trailArmPct} onChange={(value) => setDraft((prev) => ({ ...prev, trailArmPct: value }))} />
+          <DraftField
+            label="Trail arm %"
+            value={draft.trailArmPct}
+            onChange={(value) =>
+              setDraft((prev) => {
+                const next = { ...prev, trailArmPct: value };
+                const arm = Number(value);
+                const ctc = Number(prev.trailCtcPct);
+                if (/^\d+(\.\d+)?$/.test(value.trim()) && /^\d+$/.test(prev.trailCtcPct.trim()) && ctc + 1e-9 < arm) {
+                  next.trailCtcPct = String(Math.ceil(arm - 1e-9));
+                }
+                return next;
+              })
+            }
+          />
           <DraftField label="Trail lock %" value={draft.trailLockPct} onChange={(value) => setDraft((prev) => ({ ...prev, trailLockPct: value }))} />
           <DraftField label="Extra" value={draft.extra} onChange={(value) => setDraft((prev) => ({ ...prev, extra: value }))} />
           <DraftField label="Target %" value={draft.targetPct} onChange={(value) => setDraft((prev) => ({ ...prev, targetPct: value }))} />
@@ -869,6 +923,21 @@ export default function CdRangePanel({
               <option value="on">On</option>
             </select>
           </label>
+          <DraftField
+            label="TRAIL CTC"
+            value={draft.trailCtcPct}
+            inputMode="numeric"
+            onChange={(value) => setDraft((prev) => ({ ...prev, trailCtcPct: value.replace(/\D/g, "") }))}
+            onBlur={() =>
+              setDraft((prev) => {
+                const arm = Number(prev.trailArmPct);
+                if (!Number.isFinite(arm) || !/^\d+$/.test(prev.trailCtcPct.trim())) return prev;
+                const min = Math.ceil(arm - 1e-9);
+                if (Number(prev.trailCtcPct) < min) return { ...prev, trailCtcPct: String(min) };
+                return prev;
+              })
+            }
+          />
           <div className="nw-qty">{qty != null ? `Live ${live.lots} × ${CD.lotSize} = ${fmtQty(qty)}` : "Lots 1–50"}</div>
           <div className="nw-quotes">
             <span className="nw-quote">{expiryLabel ? `Expiry ${expiryLabel}` : "Expiry —"}</span>
@@ -920,6 +989,11 @@ export default function CdRangePanel({
               <span className={`font-bold ${mtm >= 0 ? "nw-up" : "nw-down"}`}>MTM {signedPts(mtm)}</span>
             )}
             <span>{position.trailArmed ? "Trail armed" : "Trail idle"}</span>
+            <span>
+              {position.ctcLocked
+                ? `TRAIL CTC locked ${ctcLockPct(live.trailCtcPct, live.trailArmPct)}%`
+                : "TRAIL CTC idle"}
+            </span>
           </div>
         )}
       </div>
@@ -988,11 +1062,29 @@ function deskStatus(opts: {
   return "Hunting";
 }
 
-function DraftField({ label, value, onChange }: { label: string; value: string; onChange: (value: string) => void }) {
+function DraftField({
+  label,
+  value,
+  onChange,
+  onBlur,
+  inputMode,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  onBlur?: () => void;
+  inputMode?: "numeric" | "decimal";
+}) {
   return (
     <label className="nw-field">
       {label}
-      <input value={value} onChange={(e) => onChange(e.target.value)} className="sow-glass-input nw-input" />
+      <input
+        value={value}
+        inputMode={inputMode}
+        onChange={(e) => onChange(e.target.value)}
+        onBlur={onBlur}
+        className="sow-glass-input nw-input"
+      />
     </label>
   );
 }

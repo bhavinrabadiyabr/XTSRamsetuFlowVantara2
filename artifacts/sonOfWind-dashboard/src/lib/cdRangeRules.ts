@@ -10,16 +10,24 @@
  * Lots 1–50 default 2. TF 1–60 default 15. Candles 1–20 default 4.
  * Min gap 0–5000 default 50. SL % 0–100 default 12.
  * Trail arm % 0–100 default 5. Trail lock % 0–100 default 0, and below the arm when above 0.
+ * TRAIL CTC is a whole number 0–100, default equal to Trail arm, and never below Trail arm.
  * Extra 0–5000 default 0. Target % 0–100 default 10. MID stop default off.
  *
  * Fixed: no new entry or flip at or after 14:30 IST. Square-off 15:14 IST.
  * Day stop at net 2. A failed sell waits 60 seconds.
  *
+ * HIGH / LOW / MID come from the active monthly SENSEX future, not the spot index.
+ * The future is the nearest BSEFO SENSEX contract whose expiry date is today or later.
+ * Expiry day stays on that contract. The next session uses the next month.
  * Bars start at 09:15 IST and are TF minutes long. HIGH / LOW come from the last
- * N fully closed bars. The forming bar is never in the range.
- * First entry is 09:15 + Candles × TF. Spot above HIGH + extra sells the ATM PE.
- * Spot below LOW − extra sells the ATM CE. After a target, stop-loss, trail, or
+ * N fully closed bars of that future. The forming bar is never in the range.
+ * First entry is 09:15 + Candles × TF. The future above HIGH + extra sells the ATM PE.
+ * The future below LOW − extra sells the ATM CE. After a target, stop-loss, trail, or
  * MID exit, wait for a print back inside HIGH and LOW, then a new break.
+ *
+ * TRAIL CTC: when the short premium has fallen by TRAIL CTC percent, move the SL to
+ * lock (TRAIL CTC − Trail arm) percent of profit. Do not park the SL at the CTC price.
+ * Arm 4 and CTC 6 lock 2% once premium is 6% under the sell.
  *
  * Exit order: 15:14 square, opposite break, MID (only if on), stop-loss, target, trail.
  * Target wins when one print jumps through the trail.
@@ -51,6 +59,7 @@ export type CdSettings = {
   slPct: number;
   trailArmPct: number;
   trailLockPct: number;
+  trailCtcPct: number;
   extra: number;
   targetPct: number;
   midStop: boolean;
@@ -64,6 +73,7 @@ export type CdDraft = {
   slPct: string;
   trailArmPct: string;
   trailLockPct: string;
+  trailCtcPct: string;
   extra: string;
   targetPct: string;
   midStop: boolean;
@@ -77,13 +87,14 @@ export const CD_DEFAULTS: CdSettings = {
   slPct: 12,
   trailArmPct: 5,
   trailLockPct: 0,
+  trailCtcPct: 5,
   extra: 0,
   targetPct: 10,
   midStop: false,
 };
 
 export const EMPTY_LOG =
-  "CD sells one SENSEX weekly ATM option on BSEFO. Lot size is 20 and the strike step is 100. Expiry is the nearest Thursday, never the same day. Orders are XTS market orders, NRML, EOS. Each box is a draft until SAVE. Defaults are lots 2, TF 15, candles 4, min gap 50, SL 12%, trail arm 5%, trail lock 0, extra 0, target 10%, and MID off. HIGH is the max high of the last N closed bars, LOW is the min low, and the forming bar stays out. The first entry is 09:15 plus candles times TF. Spot above HIGH plus extra sells the ATM PE. Spot below LOW minus extra sells the ATM CE. After a target, stop-loss, trail, or MID exit, spot has to print back inside HIGH and LOW before the next break. An opposite break covers and flips when the cutoff and the day stop allow it. No new entry or flip at or after 14:30. Square-off is 15:14, and after that this desk sends nothing else today. A failed sell waits 60 seconds. A target scores +1 only when the cover is within one point of the target percent. A trail scores 0. A losing opposite break scores −0.5. Any other loss scores −1. Net 2 stops new entries and flips.";
+  "CD sells one SENSEX weekly ATM option on BSEFO. Lot size is 20 and the strike step is 100. Expiry is the nearest Thursday, never the same day. Orders are XTS market orders, NRML, EOS. Each box is a draft until SAVE. Defaults are lots 2, TF 15, candles 4, min gap 50, SL 12%, trail arm 5%, trail lock 0, TRAIL CTC 5, extra 0, target 10%, and MID off. HIGH and LOW come from the active monthly SENSEX future, the nearest contract whose expiry is today or later. Expiry day stays on that contract, then the next month takes over. HIGH is the max high of the last N closed futures bars, LOW is the min low, and the forming bar stays out. The first entry is 09:15 plus candles times TF. The future above HIGH plus extra sells the ATM PE. The future below LOW minus extra sells the ATM CE. After a target, stop-loss, trail, or MID exit, the future has to print back inside HIGH and LOW before the next break. When premium falls by TRAIL CTC percent, the SL moves to lock TRAIL CTC minus trail arm percent. It is not placed at the CTC price. An opposite break covers and flips when the cutoff and the day stop allow it. No new entry or flip at or after 14:30. Square-off is 15:14, and after that this desk sends nothing else today. A failed sell waits 60 seconds. A target scores +1 only when the cover is within one point of the target percent. A trail scores 0. A losing opposite break scores −0.5. Any other loss scores −1. Net 2 stops new entries and flips.";
 
 export type OptionSide = "CE" | "PE";
 export type CloseLabel = "TARGET" | "TRAIL" | "OPPOSITE" | "SL" | "MID" | "SQUARE";
@@ -95,7 +106,7 @@ export type CdExit =
   | { kind: "SL" }
   | { kind: "TRAIL" }
   | { kind: "TARGET" }
-  | { kind: "NONE"; armTrail: boolean };
+  | { kind: "NONE"; armTrail: boolean; armCtc: boolean };
 
 export type CdRangePayload = {
   ok?: boolean;
@@ -114,6 +125,10 @@ export type CdRangePayload = {
   sessionDate?: string | null;
   firstBar?: string | null;
   lastBar?: string | null;
+  contract?: string | null;
+  contractExpiry?: string | null;
+  exchangeSegment?: number | null;
+  exchangeInstrumentID?: number | null;
 };
 
 const MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
@@ -195,6 +210,7 @@ export function draftFromSettings(settings: CdSettings): CdDraft {
     slPct: String(settings.slPct),
     trailArmPct: String(settings.trailArmPct),
     trailLockPct: String(settings.trailLockPct),
+    trailCtcPct: String(settings.trailCtcPct),
     extra: String(settings.extra),
     targetPct: String(settings.targetPct),
     midStop: settings.midStop,
@@ -225,13 +241,32 @@ export function validateCdDraft(draft: CdDraft): { ok: true; settings: CdSetting
   if (trailLockPct > 0 && !(trailLockPct < trailArmPct)) {
     return { ok: false, reason: "Trail lock % must be below Trail arm %." };
   }
+  const trailCtcPct = parseWhole(draft.trailCtcPct);
+  if (trailCtcPct == null || trailCtcPct < 0 || trailCtcPct > 100) {
+    return { ok: false, reason: "TRAIL CTC must be a whole number from 0 to 100." };
+  }
+  if (trailCtcPct + 1e-9 < trailArmPct) {
+    return { ok: false, reason: "TRAIL CTC must be at least the Trail arm %." };
+  }
   const extra = parseDecimal(draft.extra);
   if (extra == null || !inRange(extra, 0, 5000)) return { ok: false, reason: "Extra must be from 0 to 5000." };
   const targetPct = parseDecimal(draft.targetPct);
   if (targetPct == null || !inRange(targetPct, 0, 100)) return { ok: false, reason: "Target % must be from 0 to 100." };
   return {
     ok: true,
-    settings: { lots, tfMin, candles, minGap, slPct, trailArmPct, trailLockPct, extra, targetPct, midStop: draft.midStop === true },
+    settings: {
+      lots,
+      tfMin,
+      candles,
+      minGap,
+      slPct,
+      trailArmPct,
+      trailLockPct,
+      trailCtcPct,
+      extra,
+      targetPct,
+      midStop: draft.midStop === true,
+    },
   };
 }
 
@@ -244,6 +279,7 @@ export function sameSettings(a: CdSettings, b: CdSettings): boolean {
     a.slPct === b.slPct &&
     a.trailArmPct === b.trailArmPct &&
     a.trailLockPct === b.trailLockPct &&
+    a.trailCtcPct === b.trailCtcPct &&
     a.extra === b.extra &&
     a.targetPct === b.targetPct &&
     a.midStop === b.midStop
@@ -259,11 +295,18 @@ export function isUnsaved(draft: CdDraft, live: CdSettings): boolean {
 export function formatSaved(settings: CdSettings): string {
   const qty = orderQty(settings.lots) ?? 0;
   const mid = settings.midStop ? "on" : "off";
-  return `Saved. Lots ${settings.lots} · TF ${settings.tfMin} · Candles ${settings.candles} · Min gap ${settings.minGap} · SL ${settings.slPct}% · Trail arm ${settings.trailArmPct}% · Trail lock ${settings.trailLockPct}% · Extra ${settings.extra} · Target ${settings.targetPct}% · MID ${mid} · Qty ${qty}`;
+  return `Saved. Lots ${settings.lots} · TF ${settings.tfMin} · Candles ${settings.candles} · Min gap ${settings.minGap} · SL ${settings.slPct}% · Trail arm ${settings.trailArmPct}% · Trail lock ${settings.trailLockPct}% · TRAIL CTC ${settings.trailCtcPct} · Extra ${settings.extra} · Target ${settings.targetPct}% · MID ${mid} · Qty ${qty}`;
 }
 
 export function coerceSettings(value: Partial<CdSettings> | null | undefined): CdSettings {
   const merged = { ...CD_DEFAULTS, ...(value || {}) };
+  const arm = Number(merged.trailArmPct);
+  const storedCtc = value?.trailCtcPct;
+  if (storedCtc == null || !Number.isFinite(Number(storedCtc)) || Number(storedCtc) + 1e-9 < arm) {
+    merged.trailCtcPct = Number.isFinite(arm) ? Math.ceil(arm - 1e-9) : CD_DEFAULTS.trailCtcPct;
+  } else {
+    merged.trailCtcPct = Math.round(Number(storedCtc));
+  }
   const parsed = validateCdDraft(draftFromSettings(merged));
   return parsed.ok ? parsed.settings : CD_DEFAULTS;
 }
@@ -375,6 +418,18 @@ export function trailStopPx(sold: number, trailLockPct = CD_DEFAULTS.trailLockPc
   return (sold * (100 - trailLockPct)) / 100;
 }
 
+export function trailCtcPx(sold: number, trailCtcPct = CD_DEFAULTS.trailCtcPct): number {
+  return (sold * (100 - trailCtcPct)) / 100;
+}
+
+export function ctcLockPct(trailCtcPct: number, trailArmPct: number): number {
+  return trailCtcPct - trailArmPct;
+}
+
+export function ctcStopPx(sold: number, trailCtcPct: number, trailArmPct: number): number {
+  return (sold * (100 - ctcLockPct(trailCtcPct, trailArmPct))) / 100;
+}
+
 export function stopPx(sold: number, slPct = CD_DEFAULTS.slPct): number {
   return (sold * (100 + slPct)) / 100;
 }
@@ -426,17 +481,20 @@ export function decideExit(opts: {
   sold: number;
   ltp: number | null;
   trailArmed: boolean;
+  ctcLocked?: boolean;
   canFlip: boolean;
   midOn?: boolean;
   extra?: number;
   slPct?: number;
   trailArmPct?: number;
   trailLockPct?: number;
+  trailCtcPct?: number;
   targetPct?: number;
 }): CdExit {
   const slPct = opts.slPct ?? CD_DEFAULTS.slPct;
   const trailArmPct = opts.trailArmPct ?? CD_DEFAULTS.trailArmPct;
   const trailLockPct = opts.trailLockPct ?? CD_DEFAULTS.trailLockPct;
+  const trailCtcPct = opts.trailCtcPct ?? CD_DEFAULTS.trailCtcPct;
   const targetPct = opts.targetPct ?? CD_DEFAULTS.targetPct;
   const extra = opts.extra ?? CD_DEFAULTS.extra;
   if (squareTime(opts.hh, opts.mm)) return { kind: "SQUARE" };
@@ -455,13 +513,18 @@ export function decideExit(opts: {
   const ltp = opts.ltp;
   const sold = opts.sold;
   if (!(typeof ltp === "number" && ltp > 0) || !(sold > 0)) {
-    return { kind: "NONE", armTrail: opts.trailArmed };
+    return { kind: "NONE", armTrail: opts.trailArmed, armCtc: opts.ctcLocked === true };
   }
-  if (ltp + 1e-9 >= stopPx(sold, slPct)) return { kind: "SL" };
+  const wasLocked = opts.ctcLocked === true;
+  const hitCtc = ltp <= trailCtcPx(sold, trailCtcPct) + 1e-9;
+  const stop = wasLocked ? ctcStopPx(sold, trailCtcPct, trailArmPct) : stopPx(sold, slPct);
+  if (ltp + 1e-9 >= stop) return { kind: "SL" };
   if (ltp <= targetPx(sold, targetPct) + 1e-9) return { kind: "TARGET" };
   if (opts.trailArmed && ltp + 1e-9 >= trailStopPx(sold, trailLockPct)) return { kind: "TRAIL" };
-  if (ltp <= trailArmPx(sold, trailArmPct) + 1e-9) return { kind: "NONE", armTrail: true };
-  return { kind: "NONE", armTrail: opts.trailArmed };
+  if (ltp <= trailArmPx(sold, trailArmPct) + 1e-9 || hitCtc) {
+    return { kind: "NONE", armTrail: ltp <= trailArmPx(sold, trailArmPct) + 1e-9 || opts.trailArmed, armCtc: wasLocked || hitCtc };
+  }
+  return { kind: "NONE", armTrail: opts.trailArmed, armCtc: wasLocked };
 }
 
 export type LogKind = "info" | "entry" | "exit" | "error";

@@ -2171,7 +2171,7 @@ def md_focus():
 
 @app.get("/api/cd/range")
 def api_cd_range():
-    """Rolling HIGH/LOW of the last N closed TF-minute Sensex bars. The live bar is excluded."""
+    """Rolling HIGH/LOW of the active monthly SENSEX future. The live bar is excluded."""
     username = (_current_user() or "").strip().upper()
     if not username:
         return jsonify({"ok": False, "error": "Unauthorized", "ready": False, "tradable": False}), 401
@@ -2181,7 +2181,9 @@ def api_cd_range():
         from market.dashboard_connector import wire_market_streamer
 
         wire_market_streamer(_MD_STREAMER)
-        set_cd_md_client(lambda: _MD_STREAMER.rest_client())
+        cli = _MD_STREAMER.rest_client()
+        set_cd_md_client(lambda: cli)
+        _ensure_master_cache_today(cli, segments=["BSEFO"])
         params = parse_range_params(
             str(request.args.get("tf", "15")),
             str(request.args.get("candles", "4")),

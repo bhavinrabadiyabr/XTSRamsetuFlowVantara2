@@ -1,5 +1,10 @@
 """
-CD desk range: HIGH / LOW / MID from the last N closed TF-minute Sensex bars.
+CD desk range: HIGH / LOW / MID from the last N closed TF-minute bars of the
+active monthly SENSEX futures contract.
+
+The contract is the nearest BSEFO SENSEX future whose expiry date is still
+today or later. The expiry session stays on that contract. The next session
+uses the next month. Spot bars are not used.
 
 The forming candle is never included. A live wick does not move HIGH or LOW.
 Bars are session-aligned from 09:15 IST. The first entry is 09:15 + N × TF.
@@ -10,7 +15,8 @@ from __future__ import annotations
 import re
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from market.dada_range import (
@@ -22,15 +28,17 @@ from market.dada_range import (
     fetch_session_1m_bars,
 )
 
-SENSEX_SEGMENT = 11
-SENSEX_INSTRUMENT_ID = 26065
+BSEFO_SEGMENT = 12
 CANDLES = 4
 MIN_GAP = 50.0
 TF_MINUTES = 15
 CACHE_SECONDS = 2.0
+CONTRACT_CACHE_SECONDS = 60.0
+CONTRACT_MISS_SECONDS = 15.0
 
 _LOCK = threading.Lock()
 _CACHE: dict[str, Any] = {"at": 0.0, "day": "", "payload": None}
+_CONTRACT_CACHE: dict[str, Any] = {"at": 0.0, "day": "", "contract": None}
 _MD_CLIENT: Callable[[], Any] | None = None
 
 
@@ -131,11 +139,130 @@ def build_cd_range(
     }
 
 
-def _fetch_default() -> list[OhlcBar]:
+def _parse_expiry_date(raw: str) -> date | None:
+    text = str(raw or "").strip()
+    match = re.match(r"^(\d{4})-(\d{2})-(\d{2})", text)
+    if not match:
+        return None
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    except ValueError:
+        return None
+
+
+def sensex_futures_from_master(master_text: str) -> list[dict[str, Any]]:
+    """Monthly BSEFO SENSEX futures. SENSEX50 and options are left out."""
+    found: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for line in str(master_text or "").splitlines():
+        if "|1|SENSEX|" not in line:
+            continue
+        parts = [part.strip() for part in line.split("|")]
+        if len(parts) < 17:
+            continue
+        segment = parts[0].upper()
+        if segment not in ("BSEFO", "12"):
+            continue
+        if parts[2] not in ("1", "FUTIDX", "FUTURE", "FUTURES"):
+            continue
+        if parts[3].upper() != "SENSEX" or parts[5].upper() != "IF":
+            continue
+        expiry = _parse_expiry_date(parts[16])
+        if expiry is None or not parts[1].isdigit():
+            continue
+        instrument_id = int(parts[1])
+        if instrument_id in seen:
+            continue
+        seen.add(instrument_id)
+        found.append(
+            {
+                "segment": BSEFO_SEGMENT,
+                "instrumentId": instrument_id,
+                "symbol": parts[4] or f"SENSEX {expiry.isoformat()}",
+                "expiry": expiry.isoformat(),
+            }
+        )
+    return found
+
+
+def pick_active_sensex_future(master_text: str, now: datetime | None = None) -> dict[str, Any] | None:
+    """Nearest SENSEX future that has not passed its expiry date. Expiry day is still active."""
+    now = (now or datetime.now(IST)).astimezone(IST)
+    today = now.date()
+    live = []
+    for row in sensex_futures_from_master(master_text):
+        expiry = _parse_expiry_date(str(row.get("expiry") or ""))
+        if expiry is None or expiry < today:
+            continue
+        live.append(row)
+    if not live:
+        return None
+    live.sort(key=lambda row: (str(row["expiry"]), int(row["instrumentId"])))
+    return live[0]
+
+
+def _master_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "cache"
+
+
+def load_bsefo_master_text() -> str:
+    cache_dir = _master_dir()
+    if not cache_dir.exists():
+        return ""
+    files = sorted(cache_dir.glob("instruments_master_*BSEFO*.txt"), key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in files[:4]:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        if "|1|SENSEX|" in text:
+            return text
+    return ""
+
+
+def active_sensex_future(now: datetime | None = None, master_text: str | None = None) -> dict[str, Any] | None:
+    """Cached for the session date. A miss is retried sooner than a hit."""
+    now = (now or datetime.now(IST)).astimezone(IST)
+    day = now.date().isoformat()
+    if master_text is None:
+        with _LOCK:
+            cached = _CONTRACT_CACHE.get("contract")
+            age = time.monotonic() - float(_CONTRACT_CACHE.get("at") or 0)
+            limit = CONTRACT_CACHE_SECONDS if isinstance(cached, dict) else CONTRACT_MISS_SECONDS
+            if _CONTRACT_CACHE.get("day") == day and age < limit:
+                return cached if isinstance(cached, dict) else None
+        master_text = load_bsefo_master_text()
+    contract = pick_active_sensex_future(master_text or "", now)
+    if contract is None and not str(master_text or "").strip():
+        return None
+    with _LOCK:
+        _CONTRACT_CACHE["at"] = time.monotonic()
+        _CONTRACT_CACHE["day"] = day
+        _CONTRACT_CACHE["contract"] = contract
+    return contract
+
+
+def _contract_fields(contract: dict[str, Any] | None) -> dict[str, Any]:
+    if not contract:
+        return {
+            "contract": None,
+            "contractExpiry": None,
+            "exchangeSegment": None,
+            "exchangeInstrumentID": None,
+        }
+    return {
+        "contract": contract.get("symbol"),
+        "contractExpiry": contract.get("expiry"),
+        "exchangeSegment": contract.get("segment"),
+        "exchangeInstrumentID": contract.get("instrumentId"),
+    }
+
+
+def _fetch_contract_bars(contract: dict[str, Any]) -> list[OhlcBar]:
     return fetch_session_1m_bars(
         _xts_client(),
-        exchange_segment=SENSEX_SEGMENT,
-        exchange_instrument_id=SENSEX_INSTRUMENT_ID,
+        exchange_segment=int(contract["segment"]),
+        exchange_instrument_id=int(contract["instrumentId"]),
     )
 
 
@@ -146,27 +273,51 @@ def get_range(
     tf_minutes: int = TF_MINUTES,
     candles: int = CANDLES,
     min_gap: float = MIN_GAP,
+    contract: dict[str, Any] | None = None,
+    master_text: str | None = None,
 ) -> dict[str, Any]:
-    """Today's rolling range. Pass `bars` to skip the broker fetch."""
+    """Today's rolling range from the active monthly SENSEX future. Pass `bars` to skip the broker fetch."""
     now = (now or datetime.now(IST)).astimezone(IST)
     tf = int(tf_minutes)
     n = int(candles)
     gap = float(min_gap)
     if bars is not None:
-        return build_cd_range(bars, now, tf_minutes=tf, candles=n, min_gap=gap)
+        payload = build_cd_range(bars, now, tf_minutes=tf, candles=n, min_gap=gap)
+        payload.update(_contract_fields(contract))
+        return payload
+    if contract is None:
+        contract = active_sensex_future(now, master_text)
+    fields = _contract_fields(contract)
     if now.weekday() >= 5:
         payload = build_cd_range([], now, tf_minutes=tf, candles=n, min_gap=gap)
         payload["error"] = "Cash market is closed."
+        payload.update(fields)
         return payload
+    if not contract:
+        return {
+            "ok": False,
+            "ready": False,
+            "tradable": False,
+            "high": None,
+            "low": None,
+            "mid": None,
+            "gap": None,
+            "closedCount": 0,
+            "sessionDate": now.date().isoformat(),
+            "firstBar": None,
+            "lastBar": None,
+            "error": "Current month SENSEX futures contract was not found.",
+            **fields,
+        }
     day = now.date().isoformat()
-    cache_key = f"{day}|{tf}|{n}|{gap}"
+    cache_key = f"{day}|{tf}|{n}|{gap}|{contract.get('instrumentId')}"
     with _LOCK:
         cached = _CACHE.get("payload")
         age = time.monotonic() - float(_CACHE.get("at") or 0)
         if _CACHE.get("day") == cache_key and isinstance(cached, dict) and age < CACHE_SECONDS:
             return cached
     try:
-        fetched = _fetch_default()
+        fetched = _fetch_contract_bars(contract)
     except Exception as exc:
         return {
             "ok": False,
@@ -180,9 +331,11 @@ def get_range(
             "sessionDate": day,
             "firstBar": None,
             "lastBar": None,
-            "error": str(exc) or "Sensex range is not in yet.",
+            "error": str(exc) or "SENSEX futures range is not in yet.",
+            **fields,
         }
     payload = build_cd_range(fetched, now, tf_minutes=tf, candles=n, min_gap=gap)
+    payload.update(fields)
     with _LOCK:
         _CACHE["at"] = time.monotonic()
         _CACHE["day"] = cache_key

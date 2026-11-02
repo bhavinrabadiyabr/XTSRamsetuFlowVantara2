@@ -21,7 +21,10 @@ import {
   stopPx,
   targetPx,
   targetReached,
+  ctcStopPx,
+  coerceSettings,
   trailArmPx,
+  trailCtcPx,
   trailStopPx,
   validateCdDraft,
 } from "./cdRangeRules.ts";
@@ -144,6 +147,30 @@ assert(
 );
 assert(validateCdDraft({ ...draftFromSettings(CD_DEFAULTS), trailArmPct: "5", trailLockPct: "2" }).ok, "lock 2 under arm 5 saves");
 assert(validateCdDraft({ ...draftFromSettings(CD_DEFAULTS), trailArmPct: "0", trailLockPct: "0" }).ok, "lock 0 with arm 0 saves");
+assert(ctcStopPx(100, 6, 4) === 98, "CTC 6 and arm 4 lock the SL at 98");
+assert(trailCtcPx(100, 6) === 94, "CTC 6 is a 94 print");
+const armOnly = decideExit({ ...held, ltp: 96, trailArmPct: 4, trailCtcPct: 6 });
+assert(armOnly.kind === "NONE" && armOnly.armCtc === false, "4% arms the trail and does not move the SL");
+const ctcPrint = decideExit({ ...held, ltp: 94, trailArmPct: 4, trailCtcPct: 6 });
+assert(ctcPrint.kind === "NONE" && ctcPrint.armCtc === true, "6% marks TRAIL CTC without covering");
+assert(decideExit({ ...held, ltp: 94, trailArmPct: 4, trailCtcPct: 6, ctcLocked: true }).kind === "NONE", "94 is still under the 2% lock");
+assert(decideExit({ ...held, ltp: 98, trailArmPct: 4, trailCtcPct: 6, ctcLocked: true }).kind === "SL", "the SL covers at the 2% lock");
+assert(decideExit({ ...held, ltp: 97.5, trailArmPct: 4, trailCtcPct: 6, ctcLocked: true }).kind === "NONE", "97.5 has not reached the 2% lock");
+assert(decideExit({ ...held, ltp: 90, trailArmPct: 4, trailCtcPct: 6, ctcLocked: true }).kind === "TARGET", "target still wins under the locked SL");
+assert(
+  validateCdDraft({ ...draftFromSettings(CD_DEFAULTS), trailArmPct: "4", trailCtcPct: "6" }).ok,
+  "CTC 6 with arm 4 saves",
+);
+assert(
+  validateCdDraft({ ...draftFromSettings(CD_DEFAULTS), trailArmPct: "4", trailCtcPct: "3" }).ok === false,
+  "CTC below the arm is refused",
+);
+assert(
+  validateCdDraft({ ...draftFromSettings(CD_DEFAULTS), trailCtcPct: "4.5" }).ok === false,
+  "CTC must be a whole number",
+);
+assert(coerceSettings({ trailArmPct: 4 }).trailCtcPct === 4, "a saved arm of 4 defaults CTC to 4");
+assert(coerceSettings({ trailArmPct: 4, trailCtcPct: 6 }).trailCtcPct === 6, "a saved CTC above the arm is kept");
 assert(validateCdDraft({ ...draftFromSettings(CD_DEFAULTS), extra: "5000" }).ok, "extra 5000 saves");
 assert(breakout(106, 100, 50, 5) === "PE", "spot must clear HIGH by extra");
 assert(breakout(104, 100, 50, 5) == null, "a short extra clearance is not a break");
